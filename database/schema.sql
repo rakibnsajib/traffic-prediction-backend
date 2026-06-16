@@ -33,6 +33,17 @@ CREATE TABLE IF NOT EXISTS bangladesh_corridors (
     destination_location_id TEXT NOT NULL REFERENCES bangladesh_locations(id)
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+    photo_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_route_queries_created_at
     ON route_queries (created_at DESC);
 

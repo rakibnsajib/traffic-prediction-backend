@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import hashlib
+import hmac
+import secrets
 from datetime import date, datetime
 from typing import Any
 
@@ -25,6 +29,43 @@ DEFAULT_BANGLADESH_CORRIDORS = [
     ("cumilla_motijheel", "Cumilla Kandirpar to Motijheel", "cumilla_kandirpar", "motijheel_dhaka"),
     ("chattogram_cumilla", "Chattogram City Gate to Cumilla", "chattogram_city_gate", "cumilla_kandirpar"),
 ]
+
+DEFAULT_USERS = [
+    ("Admin", "User", "admin@tmaps.com", "Admin123@#", "admin"),
+    ("Jarin Tabassum", "Anisa", "jarin@tmaps.com", "User123@#", "user"),
+    ("Nadia", "Rahman", "nadia@tmaps.com", "User123@#", "user"),
+    ("Tanvir", "Hasan", "tanvir@tmaps.com", "User123@#", "user"),
+    ("Ayesha", "Karim", "ayesha@tmaps.com", "User123@#", "user"),
+]
+
+PASSWORD_ITERATIONS = 120_000
+
+
+def _hash_password(password: str, salt: bytes | None = None) -> str:
+    salt_bytes = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, PASSWORD_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        PASSWORD_ITERATIONS,
+        base64.b64encode(salt_bytes).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt, digest = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt_bytes = base64.b64decode(salt.encode("ascii"))
+        expected = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt_bytes,
+            int(iterations),
+        )
+        return hmac.compare_digest(base64.b64encode(expected).decode("ascii"), digest)
+    except (ValueError, TypeError):
+        return False
 
 
 def _json_load(value: Any) -> Any:
@@ -109,6 +150,20 @@ class PostgresStore:
                 )
                 cur.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id BIGSERIAL PRIMARY KEY,
+                        first_name TEXT NOT NULL,
+                        last_name TEXT NOT NULL,
+                        email TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+                        photo_url TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_route_queries_created_at
                     ON route_queries (created_at DESC)
                     """
@@ -142,7 +197,124 @@ class PostgresStore:
                     """,
                     DEFAULT_BANGLADESH_CORRIDORS,
                 )
+                cur.executemany(
+                    """
+                    INSERT INTO users (first_name, last_name, email, password_hash, role)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (email) DO NOTHING
+                    """,
+                    [
+                        (first, last, email, _hash_password(password), role)
+                        for first, last, email, password, role in DEFAULT_USERS
+                    ],
+                )
             conn.commit()
+
+    @staticmethod
+    def _public_user(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "first_name": row["first_name"],
+            "last_name": row["last_name"],
+            "email": row["email"],
+            "role": row["role"],
+            "photo_url": row.get("photo_url"),
+        }
+
+    def authenticate_user(self, email: str, password: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, first_name, last_name, email, password_hash, role, photo_url
+                FROM users
+                WHERE lower(email) = lower(%s)
+                """,
+                (email.strip(),),
+            ).fetchone()
+        if not row or not _verify_password(password, row["password_hash"]):
+            return None
+        return self._public_user(row)
+
+    def create_user(self, record: dict[str, str]) -> dict[str, Any]:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE lower(email) = lower(%s)",
+                (record["email"].strip(),),
+            ).fetchone()
+            if existing:
+                raise ValueError("Email is already registered.")
+            with conn.cursor() as cur:
+                row = cur.execute(
+                    """
+                    INSERT INTO users (first_name, last_name, email, password_hash, role)
+                    VALUES (%s, %s, %s, %s, 'user')
+                    RETURNING id, first_name, last_name, email, role, photo_url
+                    """,
+                    (
+                        record["first_name"].strip(),
+                        record["last_name"].strip(),
+                        record["email"].strip().lower(),
+                        _hash_password(record["password"]),
+                    ),
+                ).fetchone()
+            conn.commit()
+        return self._public_user(row)
+
+    def update_user_profile(self, record: dict[str, Any]) -> dict[str, Any]:
+        user_id = int(record["id"])
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE lower(email) = lower(%s) AND id <> %s",
+                (record["email"].strip(), user_id),
+            ).fetchone()
+            if existing:
+                raise ValueError("Email is already registered.")
+
+            password = record.get("password") or ""
+            if password:
+                row = conn.execute(
+                    """
+                    UPDATE users
+                    SET first_name = %s,
+                        last_name = %s,
+                        email = %s,
+                        password_hash = %s,
+                        photo_url = %s
+                    WHERE id = %s
+                    RETURNING id, first_name, last_name, email, role, photo_url
+                    """,
+                    (
+                        record["first_name"].strip(),
+                        record["last_name"].strip(),
+                        record["email"].strip().lower(),
+                        _hash_password(password),
+                        record.get("photo_url"),
+                        user_id,
+                    ),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    UPDATE users
+                    SET first_name = %s,
+                        last_name = %s,
+                        email = %s,
+                        photo_url = %s
+                    WHERE id = %s
+                    RETURNING id, first_name, last_name, email, role, photo_url
+                    """,
+                    (
+                        record["first_name"].strip(),
+                        record["last_name"].strip(),
+                        record["email"].strip().lower(),
+                        record.get("photo_url"),
+                        user_id,
+                    ),
+                ).fetchone()
+            conn.commit()
+        if not row:
+            raise ValueError("User was not found.")
+        return self._public_user(row)
 
     def insert_route_query(self, record: dict[str, Any]) -> None:
         with self._connect() as conn:

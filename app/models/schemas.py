@@ -58,3 +58,37 @@ class PredictTrafficResponse(BaseModel):
     predicted_speed: float
     predicted_travel_time: float
     traffic_level: Literal["Low", "Medium", "High"]
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SignupRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: str
+    password: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+    email: str
+    password: str | None = None
+    photo_url: str | None = None
+
+
+class UserResponse(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+    email: str
+    role: Literal["admin", "user"]
+    photo_url: str | None = None
+
+
+class AuthResponse(BaseModel):
+    user: UserResponse

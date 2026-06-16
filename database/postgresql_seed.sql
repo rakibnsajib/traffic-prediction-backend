@@ -38,10 +38,21 @@ CREATE TABLE IF NOT EXISTS bangladesh_corridors (
     destination_location_id TEXT NOT NULL REFERENCES bangladesh_locations(id)
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+    photo_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_route_queries_created_at ON route_queries (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_status_created_at ON alerts (status, created_at DESC);
 
-TRUNCATE TABLE bangladesh_corridors, bangladesh_locations, alerts, route_queries RESTART IDENTITY CASCADE;
+TRUNCATE TABLE bangladesh_corridors, bangladesh_locations, alerts, route_queries, users RESTART IDENTITY CASCADE;
 
 INSERT INTO bangladesh_locations (id, name, lat, lng) VALUES
     ('chattogram_city_gate', 'Chattogram City Gate', 22.3676, 91.7827),
@@ -353,7 +364,15 @@ INSERT INTO alerts (id, severity, title, message, context_json, status, created_
     (143, 'critical', 'Critical Congestion Corridor', 'Traffic is critically high and ETA crossed 35 minutes.', '{"eta_minutes": 764.52, "traffic_level": "High", "high_segments": 20}'::jsonb, 'active', '2026-06-16T08:27:54.976968+00:00'),
     (144, 'high', 'Multi-Segment High Congestion', 'Two or more route segments are in high congestion state.', '{"segment_id": "GOOGLE-ROUTES-0-0-0", "from_node": "Step 1 (start)", "to_node": "Step 1 (end)", "high_segments": 20}'::jsonb, 'active', '2026-06-16T08:27:55.027987+00:00');
 
+INSERT INTO users (id, first_name, last_name, email, password_hash, role, photo_url, created_at) VALUES
+    (1, 'Admin', 'User', 'admin@tmaps.com', 'pbkdf2_sha256$120000$dHJhZmZpYy1hZG1pbi1zYWx0$SiEjV2WM4JSx0gJDlsucGdRZFFJeoQ+yIpTkY80T/V8=', 'admin', NULL, NOW()),
+    (2, 'Jarin Tabassum', 'Anisa', 'jarin@tmaps.com', 'pbkdf2_sha256$120000$dHJhZmZpYy11c2VyLWphcmlu$XURaUIfqI6gK/U6fic1ZYchxbazmSSNbMUJ5y/dPFnI=', 'user', NULL, NOW()),
+    (3, 'Nadia', 'Rahman', 'nadia@tmaps.com', 'pbkdf2_sha256$120000$dHJhZmZpYy11c2VyLW5hZGlh$Few+n+w2wQvXMMZwawtISvvpyIQCjFXeO6yUZTI4PD4=', 'user', NULL, NOW()),
+    (4, 'Tanvir', 'Hasan', 'tanvir@tmaps.com', 'pbkdf2_sha256$120000$dHJhZmZpYy11c2VyLXRhbnZpcg==$M2mQAYh3ZRLLqO3chxZeE7yhE5KHYsxFfuaGwB6Az7o=', 'user', NULL, NOW()),
+    (5, 'Ayesha', 'Karim', 'ayesha@tmaps.com', 'pbkdf2_sha256$120000$dHJhZmZpYy11c2VyLWF5ZXNoYQ==$TyJ6WqX70sSIdDHiNOyLDYK3w2C05CizePb7ZWf3I9k=', 'user', NULL, NOW());
+
 SELECT setval(pg_get_serial_sequence('route_queries', 'id'), COALESCE((SELECT MAX(id) FROM route_queries), 1), true);
 SELECT setval(pg_get_serial_sequence('alerts', 'id'), COALESCE((SELECT MAX(id) FROM alerts), 1), true);
+SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(id) FROM users), 1), true);
 
 COMMIT;

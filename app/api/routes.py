@@ -1,12 +1,16 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 
 from app.ml.model_service import traffic_predictor
 from app.database.local_store import local_store
 from app.models.schemas import (
+    AuthResponse,
+    LoginRequest,
     PredictTrafficRequest,
     PredictTrafficResponse,
+    ProfileUpdateRequest,
     RouteRequest,
     RouteResponse,
+    SignupRequest,
 )
 from app.routing.routing_service import router_service
 from app.services.alert_service import alert_service
@@ -15,6 +19,39 @@ from app.services.query_store import query_store
 
 
 router = APIRouter(prefix="/api", tags=["Traffic"])
+
+
+@router.post("/auth/login", response_model=AuthResponse)
+def login(request: LoginRequest) -> dict:
+    user = local_store.authenticate_user(request.email, request.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+    return {"user": user}
+
+
+@router.post("/auth/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+def signup(request: SignupRequest) -> dict:
+    if len(request.password) < 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters.")
+    try:
+        user = local_store.create_user(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"user": user}
+
+
+@router.put("/auth/profile", response_model=AuthResponse)
+def update_profile(request: ProfileUpdateRequest) -> dict:
+    if request.password and len(request.password) < 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters.")
+    try:
+        user = local_store.update_user_profile(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"user": user}
 
 
 @router.post("/route", response_model=RouteResponse)
