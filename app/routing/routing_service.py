@@ -38,6 +38,40 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return r * c
 
 
+def _duration_seconds(value: object) -> float:
+    if not value:
+        return 0.0
+    try:
+        return float(str(value).removesuffix("s"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _geometry_distance_km(coordinates: list[list[float]]) -> float:
+    return sum(
+        _haversine(
+            coordinates[index][1],
+            coordinates[index][0],
+            coordinates[index + 1][1],
+            coordinates[index + 1][0],
+        )
+        for index in range(len(coordinates) - 1)
+    )
+
+
+GOOGLE_TRAFFIC_LEVELS = {
+    "NORMAL": "Low",
+    "SLOW": "Medium",
+    "TRAFFIC_JAM": "High",
+}
+
+GOOGLE_TRAFFIC_SPEED_FACTORS = {
+    "NORMAL": 1.0,
+    "SLOW": 0.55,
+    "TRAFFIC_JAM": 0.25,
+}
+
+
 def nearest_intersection(lat: float, lng: float) -> str:
     return min(
         INTERSECTIONS.keys(),
@@ -337,7 +371,9 @@ class RouterService:
         headers = {
             "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
             "X-Goog-FieldMask": (
-                "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
+                "routes.distanceMeters,routes.duration,routes.staticDuration,"
+                "routes.polyline.encodedPolyline,"
+                "routes.travelAdvisory.speedReadingIntervals,"
                 "routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,"
                 "routes.legs.steps.polyline.encodedPolyline"
             ),
@@ -367,6 +403,8 @@ class RouterService:
         }
         if travel_mode == "DRIVE":
             payload["routingPreference"] = "TRAFFIC_AWARE"
+            payload["extraComputations"] = ["TRAFFIC_ON_POLYLINE"]
+            payload["polylineQuality"] = "HIGH_QUALITY"
 
         try:
             with httpx.Client(timeout=12.0) as client:
@@ -387,26 +425,80 @@ class RouterService:
             route_segments: list[dict] = []
             total_route_distance_km = float(route.get("distanceMeters", 0.0)) / 1000.0
             legs = route.get("legs", [])
+            encoded_overview = route.get("polyline", {}).get("encodedPolyline", "")
+            overview_geometry = _decode_polyline(encoded_overview) if encoded_overview else []
+            speed_intervals = (
+                route.get("travelAdvisory", {}).get("speedReadingIntervals", [])
+            )
 
-            for leg_idx, leg in enumerate(legs):
-                steps = leg.get("steps", [])
-                for step_idx, step in enumerate(steps):
-                    encoded = step.get("polyline", {}).get("encodedPolyline", "")
-                    geometry = _decode_polyline(encoded) if encoded else []
+            interval_parts: list[tuple[str, list[list[float]], float]] = []
+            if len(overview_geometry) >= 2 and speed_intervals:
+                for interval in speed_intervals:
+                    start = int(interval.get("startPolylinePointIndex", 0))
+                    end = int(
+                        interval.get(
+                            "endPolylinePointIndex",
+                            len(overview_geometry),
+                        )
+                    )
+                    start = max(0, min(start, len(overview_geometry) - 2))
+                    end = max(start + 1, min(end, len(overview_geometry)))
+                    geometry = overview_geometry[start : min(end + 1, len(overview_geometry))]
                     if len(geometry) < 2:
                         continue
-
-                    distance_km = float(step.get("distanceMeters", 0.0)) / 1000.0
-                    segment_id = f"GOOGLE-ROUTES-{route_idx}-{leg_idx}-{step_idx}"
-                    pred = traffic_predictor.predict_traffic(
-                        segment_id, max(distance_km, 0.02), departure_time
+                    traffic_speed = str(interval.get("speed", "NORMAL"))
+                    interval_parts.append(
+                        (
+                            traffic_speed,
+                            geometry,
+                            max(_geometry_distance_km(geometry), 0.001),
+                        )
                     )
 
+            route_duration_seconds = _duration_seconds(route.get("duration"))
+            if interval_parts and route_duration_seconds > 0:
+                weighted_distance = sum(
+                    distance
+                    / GOOGLE_TRAFFIC_SPEED_FACTORS.get(traffic_speed, 1.0)
+                    for traffic_speed, _, distance in interval_parts
+                )
+                normal_speed_kmph = max(
+                    5.0,
+                    min(
+                        100.0,
+                        weighted_distance * 3600.0 / route_duration_seconds,
+                    ),
+                )
+                for interval_idx, (
+                    traffic_speed,
+                    geometry,
+                    distance_km,
+                ) in enumerate(interval_parts):
+                    current_speed = max(
+                        3.0,
+                        normal_speed_kmph
+                        * GOOGLE_TRAFFIC_SPEED_FACTORS.get(traffic_speed, 1.0),
+                    )
+                    traffic_level = GOOGLE_TRAFFIC_LEVELS.get(
+                        traffic_speed,
+                        "Low",
+                    )
+                    segment_id = (
+                        f"GOOGLE-TRAFFIC-{route_idx}-{interval_idx}"
+                    )
+                    pred = traffic_predictor.predict_traffic(
+                        segment_id,
+                        distance_km,
+                        departure_time,
+                        coordinates=geometry,
+                        previous_speed_kmph=current_speed,
+                        traffic_level_override=traffic_level,
+                    )
                     route_segments.append(
                         {
                             "segment_id": segment_id,
-                            "from_node": f"Step {step_idx + 1} (start)",
-                            "to_node": f"Step {step_idx + 1} (end)",
+                            "from_node": f"Traffic zone {interval_idx + 1} (start)",
+                            "to_node": f"Traffic zone {interval_idx + 1} (end)",
                             "distance_km": round(distance_km, 3),
                             "predicted_speed_kmph": pred.predicted_speed,
                             "predicted_travel_time_min": pred.predicted_travel_time,
@@ -416,12 +508,54 @@ class RouterService:
                     )
 
             if not route_segments:
-                encoded = route.get("polyline", {}).get("encodedPolyline", "")
-                geometry = _decode_polyline(encoded) if encoded else []
+                for leg_idx, leg in enumerate(legs):
+                    steps = leg.get("steps", [])
+                    for step_idx, step in enumerate(steps):
+                        encoded = step.get("polyline", {}).get("encodedPolyline", "")
+                        geometry = _decode_polyline(encoded) if encoded else []
+                        if len(geometry) < 2:
+                            continue
+
+                        distance_km = float(step.get("distanceMeters", 0.0)) / 1000.0
+                        static_seconds = _duration_seconds(
+                            step.get("staticDuration")
+                        )
+                        current_speed = (
+                            distance_km / static_seconds * 3600.0
+                            if static_seconds > 0
+                            else None
+                        )
+                        segment_id = f"GOOGLE-ROUTES-{route_idx}-{leg_idx}-{step_idx}"
+                        pred = traffic_predictor.predict_traffic(
+                            segment_id,
+                            max(distance_km, 0.02),
+                            departure_time,
+                            coordinates=geometry,
+                            previous_speed_kmph=current_speed,
+                        )
+
+                        route_segments.append(
+                            {
+                                "segment_id": segment_id,
+                                "from_node": f"Step {step_idx + 1} (start)",
+                                "to_node": f"Step {step_idx + 1} (end)",
+                                "distance_km": round(distance_km, 3),
+                                "predicted_speed_kmph": pred.predicted_speed,
+                                "predicted_travel_time_min": pred.predicted_travel_time,
+                                "congestion_level": pred.traffic_level,
+                                "coordinates": geometry,
+                            }
+                        )
+
+            if not route_segments:
+                geometry = overview_geometry
                 if len(geometry) >= 2:
                     segment_id = f"GOOGLE-ROUTES-{route_idx}-overview"
                     pred = traffic_predictor.predict_traffic(
-                        segment_id, max(total_route_distance_km, 0.02), departure_time
+                        segment_id,
+                        max(total_route_distance_km, 0.02),
+                        departure_time,
+                        coordinates=geometry,
                     )
                     route_segments.append(
                         {
@@ -527,7 +661,10 @@ class RouterService:
                     distance_km = float(step.get("distance", {}).get("value", 0.0)) / 1000.0
                     segment_id = f"GOOGLE-{route_idx}-{leg_idx}-{step_idx}"
                     pred = traffic_predictor.predict_traffic(
-                        segment_id, max(distance_km, 0.02), departure_time
+                        segment_id,
+                        max(distance_km, 0.02),
+                        departure_time,
+                        coordinates=geometry,
                     )
                     name = step.get("html_instructions", "")
                     clean_name = (
@@ -630,7 +767,10 @@ class RouterService:
                     distance_km = float(step.get("distance", 0.0)) / 1000.0
                     segment_id = f"OSRM-{route_idx}-{leg_idx}-{step_idx}"
                     pred = traffic_predictor.predict_traffic(
-                        segment_id, max(distance_km, 0.02), departure_time
+                        segment_id,
+                        max(distance_km, 0.02),
+                        departure_time,
+                        coordinates=geometry,
                     )
                     name = step.get("name") or f"Road {step_idx + 1}"
                     route_segments.append(
@@ -651,7 +791,10 @@ class RouterService:
                     distance_km = float(route.get("distance", 0.0)) / 1000.0
                     segment_id = f"OSRM-OVERVIEW-{route_idx}"
                     pred = traffic_predictor.predict_traffic(
-                        segment_id, max(distance_km, 0.02), departure_time
+                        segment_id,
+                        max(distance_km, 0.02),
+                        departure_time,
+                        coordinates=route_geometry,
                     )
                     route_segments.append(
                         {
@@ -745,7 +888,10 @@ class RouterService:
         distance_km = float(route.get("distance", 0.0)) / 1000.0
         segment_id = "OSRM-OVERVIEW-0"
         pred = traffic_predictor.predict_traffic(
-            segment_id, max(distance_km, 0.02), departure_time
+            segment_id,
+            max(distance_km, 0.02),
+            departure_time,
+            coordinates=geometry,
         )
         segment = {
             "segment_id": segment_id,
@@ -776,7 +922,12 @@ class RouterService:
             segment_id = edge_data["segment_id"]
             distance = float(edge_data["distance_km"])
             coordinates = edge_data.get("coordinates") or road_geometry_between_nodes(path[i], path[i + 1])
-            pred = traffic_predictor.predict_traffic(segment_id, distance, departure_time)
+            pred = traffic_predictor.predict_traffic(
+                segment_id,
+                distance,
+                departure_time,
+                coordinates=coordinates,
+            )
             segments.append(
                 {
                     "segment_id": segment_id,
@@ -863,33 +1014,60 @@ class RouterService:
         departure_time: datetime,
         travel_mode: str = "TRANSIT",
     ) -> dict:
-        google_routes_api_result = self._google_routes_api(
-            source_lat, source_lng, destination_lat, destination_lng, departure_time, travel_mode
-        )
-        if google_routes_api_result:
-            return google_routes_api_result
+        corridor = [
+            [source_lng, source_lat],
+            [destination_lng, destination_lat],
+        ]
+        with traffic_predictor.live_context(corridor):
+            google_routes_api_result = self._google_routes_api(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+                travel_mode,
+            )
+            if google_routes_api_result:
+                return google_routes_api_result
 
-        google_result = self._google_routes(
-            source_lat, source_lng, destination_lat, destination_lng, departure_time, travel_mode
-        )
-        if google_result:
-            return google_result
+            google_result = self._google_routes(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+                travel_mode,
+            )
+            if google_result:
+                return google_result
 
-        osrm_result = self._osrm_routes(
-            source_lat, source_lng, destination_lat, destination_lng, departure_time
-        )
-        if osrm_result:
-            return osrm_result
+            osrm_result = self._osrm_routes(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+            )
+            if osrm_result:
+                return osrm_result
 
-        osrm_overview_result = self._osrm_overview_route(
-            source_lat, source_lng, destination_lat, destination_lng, departure_time
-        )
-        if osrm_overview_result:
-            return osrm_overview_result
+            osrm_overview_result = self._osrm_overview_route(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+            )
+            if osrm_overview_result:
+                return osrm_overview_result
 
-        return self._graph_fallback(
-            source_lat, source_lng, destination_lat, destination_lng, departure_time
-        )
+            return self._graph_fallback(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+            )
 
     @staticmethod
     def mock_route_fallback(

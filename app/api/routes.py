@@ -13,12 +13,34 @@ from app.models.schemas import (
     SignupRequest,
 )
 from app.routing.routing_service import router_service
+from app.routing.graph_data import INTERSECTIONS, ROAD_SEGMENTS
 from app.services.alert_service import alert_service
 from app.services.geocode_service import geocode_service
 from app.services.query_store import query_store
 
 
 router = APIRouter(prefix="/api", tags=["Traffic"])
+
+
+def _coordinates_for_segment(
+    road_segment_id: str,
+) -> list[list[float]] | None:
+    segment = next(
+        (
+            item
+            for item in ROAD_SEGMENTS
+            if item["segment_id"] == road_segment_id
+        ),
+        None,
+    )
+    if not segment:
+        return None
+    start = INTERSECTIONS[segment["from_node"]]
+    end = INTERSECTIONS[segment["to_node"]]
+    return [
+        [start["lng"], start["lat"]],
+        [end["lng"], end["lat"]],
+    ]
 
 
 @router.post("/auth/login", response_model=AuthResponse)
@@ -76,6 +98,7 @@ def predict_traffic(request: PredictTrafficRequest) -> dict:
         road_segment_id=request.road_segment_id,
         distance_km=distance_assumption_km,
         timestamp=request.timestamp,
+        coordinates=_coordinates_for_segment(request.road_segment_id),
     )
     alert_service.evaluate_prediction(
         road_segment_id=request.road_segment_id,

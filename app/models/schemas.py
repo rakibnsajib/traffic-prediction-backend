@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -14,7 +14,7 @@ class RouteRequest(BaseModel):
     destination: Coordinate
     travel_mode: Literal["DRIVE", "WALK", "BICYCLE", "TRANSIT"] = "DRIVE"
     departure_time: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Optional ISO-8601 datetime string for departure. Defaults to current UTC time.",
     )
 

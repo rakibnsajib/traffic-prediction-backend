@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 import json
-import hashlib
 from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
+
+from app.services.tomtom_traffic_service import tomtom_traffic_service
+from app.services.weather_service import weather_service
 
 
 ML_DIR = Path(__file__).resolve().parents[2] / "ml"
 MODEL_PATH = ML_DIR / "traffic_model.pkl"
 METRICS_PATH = ML_DIR / "model_metrics.json"
-SAMPLE_DATA_PATH = ML_DIR / "sample_dataset.csv"
+PREVIEW_PATH = ML_DIR / "real_dataset_preview.csv"
 
 
 @dataclass
@@ -22,6 +26,18 @@ class PredictionResult:
     predicted_speed: float
     predicted_travel_time: float
     traffic_level: str
+
+
+@dataclass(frozen=True)
+class LivePredictionInputs:
+    previous_speed_kmph: float | None
+    weather: object | None
+
+
+_live_inputs: ContextVar[LivePredictionInputs | None] = ContextVar(
+    "traffic_live_inputs",
+    default=None,
+)
 
 
 def _traffic_level_from_speed(speed: float) -> str:
@@ -34,95 +50,153 @@ def _traffic_level_from_speed(speed: float) -> str:
 
 class TrafficPredictor:
     def __init__(self) -> None:
-        self.model_bundle = None
-        if MODEL_PATH.exists():
-            self.model_bundle = joblib.load(MODEL_PATH)
-        self._fallback_mean_speed = 26.0
-        self._segment_bias = {
-            "R101": 1.0,
-            "R102": -2.5,
-            "R103": -1.0,
-            "R104": -3.0,
-            "R105": 0.5,
-            "R106": -1.7,
-            "R107": -2.0,
-            "R108": 0.3,
-            "R109": -0.4,
-            "R110": 0.7,
-        }
-        self._segment_adjustment = {
-            "R103": 2.5,
-            "R104": 2.0,
-            "R105": -4.5,
-            "R106": -4.0,
-        }
-
-    @staticmethod
-    def _dynamic_fallback_speed(
-        road_segment_id: str,
-        hour: int,
-        is_weekend: int,
-        base_speed: float,
-    ) -> float:
-        # Generate stable per-segment variation for unseen real-world road IDs.
-        digest = hashlib.md5(road_segment_id.encode("utf-8")).hexdigest()
-        road_factor = (int(digest[:2], 16) / 255.0) * 10.0 - 5.0  # -5..+5
-
-        peak_penalty = 0.0
-        if 7 <= hour <= 10 or 16 <= hour <= 20:
-            peak_penalty = 6.0
-        weekend_bonus = 2.0 if is_weekend else 0.0
-
-        speed = base_speed + road_factor - peak_penalty + weekend_bonus
-        return max(speed, 6.0)
-
-    def predict_speed(self, road_segment_id: str, timestamp: datetime) -> float:
-        hour = timestamp.hour
-        day_of_week = timestamp.weekday()
-        is_weekend = int(day_of_week >= 5)
-        previous_speed = 25.0
-        weather_condition = "clear"
-
-        if self.model_bundle:
-            model = self.model_bundle["model"]
-            encoder = self.model_bundle["encoder"]
-            weather_map = self.model_bundle.get(
-                "weather_map", {"clear": 0, "rain": 1, "fog": 2}
-            )
-            if road_segment_id in getattr(encoder, "classes_", []):
-                seg_encoded = encoder.transform([road_segment_id])[0]
-                weather_encoded = weather_map.get(weather_condition, 0)
-                X = np.array(
-                    [[hour, day_of_week, is_weekend, previous_speed, seg_encoded, weather_encoded]]
-                )
-                speed = float(model.predict(X)[0])
-                speed += self._segment_adjustment.get(road_segment_id, 0.0)
-                return max(speed, 5.0)
-            return self._dynamic_fallback_speed(
-                road_segment_id=road_segment_id,
-                hour=hour,
-                is_weekend=is_weekend,
-                base_speed=self._fallback_mean_speed,
-            )
-
-        speed = self._dynamic_fallback_speed(
-            road_segment_id=road_segment_id,
-            hour=hour,
-            is_weekend=is_weekend,
-            base_speed=(
-                self._fallback_mean_speed
-                + self._segment_bias.get(road_segment_id, 0.0)
-                + self._segment_adjustment.get(road_segment_id, 0.0)
-            ),
+        self.model_bundle = (
+            joblib.load(MODEL_PATH) if MODEL_PATH.exists() else None
         )
-        return speed
+
+    @contextmanager
+    def live_context(
+        self,
+        coordinates: list[list[float]] | None,
+    ):
+        """Fetch live corridor inputs once and reuse them for all route segments."""
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            speed_future = executor.submit(
+                tomtom_traffic_service.current_speed_kmph,
+                coordinates,
+            )
+            weather_future = executor.submit(
+                weather_service.current_weather,
+                coordinates,
+            )
+            previous_speed = speed_future.result()
+            weather = weather_future.result()
+        inputs = LivePredictionInputs(
+            previous_speed_kmph=previous_speed,
+            weather=weather,
+        )
+        token = _live_inputs.set(inputs)
+        try:
+            yield
+        finally:
+            _live_inputs.reset(token)
+
+    def _feature_row(
+        self,
+        timestamp: datetime,
+        coordinates: list[list[float]] | None,
+        previous_speed_kmph: float | None = None,
+    ) -> dict[str, float | int]:
+        bundle = self.model_bundle or {}
+        weather_defaults = bundle.get("weather_defaults", {})
+        live_inputs = _live_inputs.get()
+        previous_speed = previous_speed_kmph
+        if previous_speed is None:
+            previous_speed = (
+                live_inputs.previous_speed_kmph
+                if live_inputs is not None
+                else tomtom_traffic_service.current_speed_kmph(coordinates)
+            )
+        if previous_speed is None:
+            previous_speed = float(
+                bundle.get("default_previous_speed_kmph", 40.0)
+            )
+
+        weather = (
+            live_inputs.weather
+            if live_inputs is not None
+            else weather_service.current_weather(coordinates)
+        )
+        if weather is None:
+            temperature_c = float(
+                weather_defaults.get("temperature_c", 20.0)
+            )
+            relative_humidity = float(
+                weather_defaults.get("relative_humidity", 60.0)
+            )
+            precipitation_mm = float(
+                weather_defaults.get("precipitation_mm", 0.0)
+            )
+            wind_speed_kmph = float(
+                weather_defaults.get("wind_speed_kmph", 5.0)
+            )
+            is_rain = int(weather_defaults.get("is_rain", 0))
+            is_fog = int(weather_defaults.get("is_fog", 0))
+            is_cloudy = int(weather_defaults.get("is_cloudy", 0))
+        else:
+            temperature_c = weather.temperature_c
+            relative_humidity = weather.relative_humidity
+            precipitation_mm = weather.precipitation_mm
+            wind_speed_kmph = weather.wind_speed_kmph
+            is_rain = weather.is_rain
+            is_fog = weather.is_fog
+            is_cloudy = weather.is_cloudy
+
+        return {
+            "hour": timestamp.hour,
+            "day_of_week": timestamp.weekday(),
+            "is_weekend": int(timestamp.weekday() >= 5),
+            "previous_speed_kmph": previous_speed,
+            "temperature_c": temperature_c,
+            "relative_humidity": relative_humidity,
+            "precipitation_mm": precipitation_mm,
+            "wind_speed_kmph": wind_speed_kmph,
+            "is_rain": is_rain,
+            "is_fog": is_fog,
+            "is_cloudy": is_cloudy,
+        }
+
+    def predict_speed(
+        self,
+        road_segment_id: str,
+        timestamp: datetime,
+        coordinates: list[list[float]] | None = None,
+        previous_speed_kmph: float | None = None,
+    ) -> float:
+        _ = road_segment_id
+        row = self._feature_row(
+            timestamp,
+            coordinates,
+            previous_speed_kmph=previous_speed_kmph,
+        )
+        if not self.model_bundle:
+            return max(float(row["previous_speed_kmph"]), 5.0)
+
+        feature_names = self.model_bundle["feature_names"]
+        features = pd.DataFrame([row], columns=feature_names)
+        model_output = float(
+            self.model_bundle["model"].predict(features)[0]
+        )
+        speed = (
+            float(row["previous_speed_kmph"]) + model_output
+            if self.model_bundle.get("target_type") == "speed_delta"
+            else model_output
+        )
+
+        # Keep only physical road-speed bounds. Training-quantile clipping
+        # would incorrectly force congested Dhaka speeds up to the minimum
+        # observed on the Los Angeles freeway training corridor.
+        lower = 3.0
+        upper = 130.0
+        return min(max(speed, lower), upper)
 
     def predict_traffic(
-        self, road_segment_id: str, distance_km: float, timestamp: datetime
+        self,
+        road_segment_id: str,
+        distance_km: float,
+        timestamp: datetime,
+        coordinates: list[list[float]] | None = None,
+        previous_speed_kmph: float | None = None,
+        traffic_level_override: str | None = None,
     ) -> PredictionResult:
-        speed = self.predict_speed(road_segment_id, timestamp)
+        speed = self.predict_speed(
+            road_segment_id,
+            timestamp,
+            coordinates,
+            previous_speed_kmph=previous_speed_kmph,
+        )
         travel_time = (distance_km / speed) * 60.0
-        level = _traffic_level_from_speed(speed)
+        level = traffic_level_override or _traffic_level_from_speed(speed)
         return PredictionResult(
             predicted_speed=round(speed, 2),
             predicted_travel_time=round(travel_time, 2),
@@ -133,18 +207,18 @@ class TrafficPredictor:
         if METRICS_PATH.exists():
             return json.loads(METRICS_PATH.read_text(encoding="utf-8"))
         return {
-            "model": "FallbackRuleBased",
+            "model": "LiveSpeedFallback",
             "mae": None,
             "rmse": None,
             "r2_score": None,
-            "note": "Train model from backend with `python ml/train_model.py` to generate metrics.",
+            "note": "Run `python ml/train_model.py` from backend.",
         }
 
     def sample_data(self, limit: int = 25) -> list[dict]:
-        if SAMPLE_DATA_PATH.exists():
-            df = pd.read_csv(SAMPLE_DATA_PATH)
-            return df.head(limit).to_dict(orient="records")
-        return []
+        if not PREVIEW_PATH.exists():
+            return []
+        data = pd.read_csv(PREVIEW_PATH).head(limit)
+        return data.where(pd.notna(data), None).to_dict(orient="records")
 
 
 traffic_predictor = TrafficPredictor()

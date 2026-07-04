@@ -7,7 +7,7 @@ FastAPI backend for route generation, traffic prediction, alerts, and dashboard 
 - FastAPI
 - Uvicorn
 - PostgreSQL
-- scikit-learn model artifacts in `ml/`
+- XGBoost model artifact in `ml/`
 
 ## Environment
 
@@ -16,9 +16,34 @@ Create `backend/.env` from `.env.example`:
 ```env
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/traffic_prediction
 GOOGLE_MAPS_API_KEY=your_google_maps_api_key
+TOMTOM_API_KEY=your_tomtom_api_key
+OPEN_METEO_CACHE_SECONDS=300
 ```
 
-`DATABASE_URL` is required for PostgreSQL persistence. `GOOGLE_MAPS_API_KEY` is required for Google routing/geocoding.
+`DATABASE_URL` is required for PostgreSQL persistence. `GOOGLE_MAPS_API_KEY` is required for Google routing/geocoding. `TOMTOM_API_KEY` supplies the current road speed used as the model's `previous_speed`. Open-Meteo supplies current weather without an API key. Both integrations fall back safely when unavailable.
+
+TomTom Traffic Flow coverage varies by country and road. Unsupported points are cached briefly and use the model's existing fallback speed.
+
+## Real Dataset and Training
+
+The production XGBoost model is trained on the Kaggle **US Traffic Data with Weather and Calendar** dataset, containing 34,823 real five-minute PeMS traffic and weather observations. It forecasts speed 15 minutes ahead using current speed, time, temperature, humidity, precipitation, wind, and weather-condition flags.
+
+```bash
+python ml/train_model.py
+```
+
+The raw dataset is stored at `ml/real_data/traffic_weather_full2020.csv`. The training split is chronological to avoid leaking future observations into evaluation.
+
+### Time-Series Model Benchmark
+
+The isolated benchmark does not replace the production model:
+
+```bash
+pip install -r ml/benchmark_requirements.txt
+python ml/benchmark_time_series_models.py
+```
+
+It compares persistence, HistGradientBoosting, Random Forest, Extra Trees, XGBoost, and LightGBM using the same chronological split and writes the report to `ml/time_series_model_benchmark.md`.
 
 ## Install
 

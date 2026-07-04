@@ -87,8 +87,9 @@ def test_predict_traffic_and_active_alerts(monkeypatch) -> None:
         road_segment_id: str,
         distance_km: float,
         timestamp: datetime,
+        coordinates: list[list[float]] | None = None,
     ) -> PredictionResult:
-        _ = (road_segment_id, distance_km, timestamp)
+        _ = (road_segment_id, distance_km, timestamp, coordinates)
         return PredictionResult(
             predicted_speed=8.5,
             predicted_travel_time=5.5,

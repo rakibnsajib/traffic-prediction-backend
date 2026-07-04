@@ -1,8 +1,18 @@
 {
-  "model": "RandomForestRegressor",
-  "mae": 0.9798,
-  "rmse": 1.3605,
-  "r2_score": 0.9073,
-  "train_size": 40,
-  "test_size": 11
+  "model": "XGBRegressor",
+  "target": "15-minute speed change",
+  "dataset": "US Traffic Data with Weather and Calendar (PeMS)",
+  "dataset_source": "https://www.kaggle.com/datasets/maryamshoaei/us-traffic-data-with-weather-and-calendar-dataset",
+  "forecast_horizon_minutes": 15,
+  "speed_unit": "km/h",
+  "split": "chronological 80/20",
+  "mae": 1.0652,
+  "rmse": 2.0919,
+  "r2_score": 0.7106,
+  "persistence_baseline_mae": 1.1341,
+  "train_size": 27800,
+  "test_size": 6951,
+  "total_valid_rows": 34751,
+  "training_period_start": "2020-02-01T00:00:00",
+  "training_period_end": "2020-05-31T23:40:00"
 }
