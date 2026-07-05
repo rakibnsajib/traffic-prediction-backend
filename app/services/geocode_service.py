@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-import os
-
 import httpx
 
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-GOOGLE_GEOCODING_URL = os.getenv(
-    "GOOGLE_GEOCODING_URL", "https://maps.googleapis.com/maps/api/geocode/json"
-)
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 NOMINATIM_HEADERS = {"User-Agent": "AI-Traffic-Route-Finder/1.0 (demo project)"}
@@ -138,38 +132,6 @@ class GeocodeService:
         local_matches = _local_place_matches(clean_query, limit)
         external_results = []
 
-        if GOOGLE_MAPS_API_KEY:
-            params = {
-                "address": f"{clean_query}, Bangladesh",
-                "components": "country:BD",
-                "region": "bd",
-                "key": GOOGLE_MAPS_API_KEY,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    response = await client.get(GOOGLE_GEOCODING_URL, params=params)
-                    response.raise_for_status()
-                    payload = response.json()
-            except Exception:
-                payload = {}
-
-            if payload.get("status") == "OK":
-                for item in payload.get("results", [])[: max(1, min(limit, 10))]:
-                    try:
-                        location = item["geometry"]["location"]
-                        external_results.append(
-                            {
-                                "name": item.get("formatted_address", "Unknown place"),
-                                "place_id": item.get("place_id"),
-                                "lat": float(location["lat"]),
-                                "lng": float(location["lng"]),
-                            }
-                        )
-                    except Exception:
-                        continue
-                if external_results:
-                    return _dedupe_results([*local_matches, *external_results], limit)
-
         photon_params = {
             "q": f"{clean_query}, Bangladesh",
             "limit": max(1, min(limit, 10)),
@@ -259,31 +221,6 @@ class GeocodeService:
         return local_matches
 
     async def reverse(self, lat: float, lng: float) -> dict | None:
-        if GOOGLE_MAPS_API_KEY:
-            params = {
-                "latlng": f"{lat},{lng}",
-                "key": GOOGLE_MAPS_API_KEY,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    response = await client.get(GOOGLE_GEOCODING_URL, params=params)
-                    response.raise_for_status()
-                    payload = response.json()
-            except Exception:
-                payload = {}
-
-            if payload.get("status") == "OK" and payload.get("results"):
-                item = payload["results"][0]
-                name = item.get("formatted_address")
-                if name:
-                    return {
-                        "name": name,
-                        "display_name": name,
-                        "place_id": item.get("place_id"),
-                        "lat": lat,
-                        "lng": lng,
-                    }
-
         params = {
             "lat": lat,
             "lon": lng,

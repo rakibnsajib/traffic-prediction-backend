@@ -20,7 +20,7 @@ TOMTOM_API_KEY=your_tomtom_api_key
 OPEN_METEO_CACHE_SECONDS=300
 ```
 
-`DATABASE_URL` is required for PostgreSQL persistence. `GOOGLE_MAPS_API_KEY` is required for Google routing/geocoding. `TOMTOM_API_KEY` supplies the current road speed used as the model's `previous_speed`. Open-Meteo supplies current weather without an API key. Both integrations fall back safely when unavailable.
+`DATABASE_URL` is required for PostgreSQL persistence. `GOOGLE_MAPS_API_KEY` is required for Google routing. Address search uses local Bangladesh suggestions, Photon, and Nominatim. `TOMTOM_API_KEY` supplies the current road speed used as the model's `previous_speed`. Open-Meteo supplies current weather without an API key. The live integrations fall back safely when unavailable.
 
 TomTom Traffic Flow coverage varies by country and road. Unsupported points are cached briefly and use the model's existing fallback speed.
 
