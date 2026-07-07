@@ -23,6 +23,10 @@ GOOGLE_ROUTES_API_URL = os.getenv(
     "GOOGLE_ROUTES_API_URL", "https://routes.googleapis.com/directions/v2:computeRoutes"
 )
 MAX_ROUTE_ALTERNATIVES = int(os.getenv("MAX_ROUTE_ALTERNATIVES", "6"))
+TARGET_ROUTE_ALTERNATIVES = min(MAX_ROUTE_ALTERNATIVES, 3)
+MAX_ALTERNATIVE_DISTANCE_RATIO = 1.85
+MAX_ALTERNATIVE_TIME_RATIO = 2.5
+MAX_ROUTE_OVERLAP_RATIO = 0.82
 
 
 class GoogleRoutingError(RuntimeError):
@@ -57,6 +61,87 @@ def _geometry_distance_km(coordinates: list[list[float]]) -> float:
         )
         for index in range(len(coordinates) - 1)
     )
+
+
+def _route_grid_cells(
+    segments: list[dict],
+    precision: int = 3,
+) -> set[tuple[float, float]]:
+    """Represent route geometry as ~100 m grid cells for provider-agnostic deduplication."""
+    cells: set[tuple[float, float]] = set()
+    scale = 10**precision
+    for segment in segments:
+        coordinates = segment.get("coordinates") or []
+        for index in range(len(coordinates) - 1):
+            start_lng, start_lat = coordinates[index]
+            end_lng, end_lat = coordinates[index + 1]
+            steps = max(
+                1,
+                min(
+                    2_000,
+                    int(
+                        max(
+                            abs(end_lng - start_lng),
+                            abs(end_lat - start_lat),
+                        )
+                        * scale
+                    ),
+                ),
+            )
+            for step in range(steps + 1):
+                fraction = step / steps
+                cells.add(
+                    (
+                        round(start_lng + (end_lng - start_lng) * fraction, precision),
+                        round(start_lat + (end_lat - start_lat) * fraction, precision),
+                    )
+                )
+    return cells
+
+
+def _route_overlap_ratio(first: list[dict], second: list[dict]) -> float:
+    first_cells = _route_grid_cells(first)
+    second_cells = _route_grid_cells(second)
+    if not first_cells or not second_cells:
+        return 0.0
+    return len(first_cells & second_cells) / min(len(first_cells), len(second_cells))
+
+
+def _corridor_waypoints(
+    source_lat: float,
+    source_lng: float,
+    destination_lat: float,
+    destination_lng: float,
+) -> list[tuple[str, float, float]]:
+    """Create left/right midpoint offsets that encourage genuinely different corridors."""
+    midpoint_lat = (source_lat + destination_lat) / 2.0
+    midpoint_lng = (source_lng + destination_lng) / 2.0
+    latitude_km_per_degree = 111.32
+    longitude_km_per_degree = max(
+        111.32 * cos(radians(midpoint_lat)),
+        0.1,
+    )
+    east_km = (destination_lng - source_lng) * longitude_km_per_degree
+    north_km = (destination_lat - source_lat) * latitude_km_per_degree
+    straight_distance_km = sqrt(east_km**2 + north_km**2)
+    if straight_distance_km < 2.0:
+        return []
+
+    perpendicular_east = -north_km / straight_distance_km
+    perpendicular_north = east_km / straight_distance_km
+    offset_km = max(0.8, min(2.5, straight_distance_km * 0.20))
+
+    waypoints = []
+    for side in (-1.0, 1.0):
+        waypoint_lat = midpoint_lat + (
+            perpendicular_north * offset_km * side / latitude_km_per_degree
+        )
+        waypoint_lng = midpoint_lng + (
+            perpendicular_east * offset_km * side / longitude_km_per_degree
+        )
+        direction = "east" if waypoint_lng >= midpoint_lng else "west"
+        waypoints.append((direction, waypoint_lat, waypoint_lng))
+    return waypoints
 
 
 GOOGLE_TRAFFIC_LEVELS = {
@@ -355,6 +440,69 @@ class RouterService:
         if len(merged) <= len(existing_alts):
             return base_result
         return self._response_from_alternatives(merged)
+
+    def _merge_route_results(self, results: list[dict | None]) -> dict | None:
+        candidates: list[dict] = []
+        for result in results:
+            if not result:
+                continue
+            for route in result.get("alternatives") or []:
+                segments = route.get("segments") or []
+                if not segments:
+                    continue
+                distance_km, time_min = self._aggregate(segments)
+                candidates.append(
+                    {
+                        **route,
+                        "total_distance_km": distance_km,
+                        "total_time_min": time_min,
+                    }
+                )
+
+        if not candidates:
+            return None
+
+        best_distance = min(route["total_distance_km"] for route in candidates)
+        best_time = min(route["total_time_min"] for route in candidates)
+        reasonable = [
+            route
+            for route in candidates
+            if route["total_distance_km"]
+            <= max(best_distance * MAX_ALTERNATIVE_DISTANCE_RATIO, best_distance + 1.0)
+            and route["total_time_min"]
+            <= max(best_time * MAX_ALTERNATIVE_TIME_RATIO, best_time + 3.0)
+        ]
+        reasonable.sort(
+            key=lambda route: (
+                route["total_time_min"],
+                route["total_distance_km"],
+            )
+        )
+
+        distinct: list[dict] = []
+        used_ids: set[str] = set()
+        for route in reasonable:
+            if any(
+                _route_overlap_ratio(route["segments"], kept["segments"])
+                >= MAX_ROUTE_OVERLAP_RATIO
+                for kept in distinct
+            ):
+                continue
+
+            original_id = str(route.get("route_id") or "route")
+            route_id = original_id
+            suffix = 2
+            while route_id in used_ids:
+                route_id = f"{original_id}_{suffix}"
+                suffix += 1
+            used_ids.add(route_id)
+            distinct.append({**route, "route_id": route_id})
+            if len(distinct) >= MAX_ROUTE_ALTERNATIVES:
+                break
+
+        if not distinct:
+            distinct = [min(candidates, key=lambda route: route["total_time_min"])]
+        return self._response_from_alternatives(distinct)
 
     def _google_routes_api(
         self,
@@ -729,20 +877,32 @@ class RouterService:
         destination_lat: float,
         destination_lng: float,
         departure_time: datetime,
+        waypoints: list[tuple[float, float]] | None = None,
+        alternatives: int | bool = TARGET_ROUTE_ALTERNATIVES,
+        route_id_prefix: str = "osrm",
+        timeout_seconds: float = 12.0,
     ) -> dict | None:
-        url = (
-            f"{OSRM_BASE_URL}/route/v1/driving/"
-            f"{source_lng},{source_lat};{destination_lng},{destination_lat}"
+        route_points = [
+            (source_lat, source_lng),
+            *(waypoints or []),
+            (destination_lat, destination_lng),
+        ]
+        coordinates = ";".join(f"{lng},{lat}" for lat, lng in route_points)
+        url = f"{OSRM_BASE_URL}/route/v1/driving/{coordinates}"
+        alternatives_value = (
+            str(alternatives).lower()
+            if isinstance(alternatives, bool)
+            else str(max(1, min(alternatives, MAX_ROUTE_ALTERNATIVES)))
         )
         params = {
-            "alternatives": "true",
+            "alternatives": alternatives_value,
             "steps": "true",
             "overview": "full",
             "geometries": "geojson",
             "annotations": "false",
         }
         try:
-            with httpx.Client(timeout=12.0) as client:
+            with httpx.Client(timeout=timeout_seconds) as client:
                 response = client.get(url, params=params)
                 response.raise_for_status()
                 payload = response.json()
@@ -755,6 +915,10 @@ class RouterService:
 
         parsed_routes: list[list[dict]] = []
         route_meta: list[dict] = []
+        segment_prefix = "".join(
+            character if character.isalnum() else "_"
+            for character in route_id_prefix.upper()
+        )
         for route_idx, route in enumerate(routes[:MAX_ROUTE_ALTERNATIVES]):
             route_segments: list[dict] = []
             legs = route.get("legs", [])
@@ -765,7 +929,9 @@ class RouterService:
                     if len(geometry) < 2:
                         continue
                     distance_km = float(step.get("distance", 0.0)) / 1000.0
-                    segment_id = f"OSRM-{route_idx}-{leg_idx}-{step_idx}"
+                    segment_id = (
+                        f"{segment_prefix}-{route_idx}-{leg_idx}-{step_idx}"
+                    )
                     pred = traffic_predictor.predict_traffic(
                         segment_id,
                         max(distance_km, 0.02),
@@ -789,7 +955,7 @@ class RouterService:
                 route_geometry = route.get("geometry", {}).get("coordinates", [])
                 if len(route_geometry) >= 2:
                     distance_km = float(route.get("distance", 0.0)) / 1000.0
-                    segment_id = f"OSRM-OVERVIEW-{route_idx}"
+                    segment_id = f"{segment_prefix}-OVERVIEW-{route_idx}"
                     pred = traffic_predictor.predict_traffic(
                         segment_id,
                         max(distance_km, 0.02),
@@ -838,7 +1004,7 @@ class RouterService:
             d_km, t_min = self._aggregate(segments)
             alternatives.append(
                 {
-                    "route_id": f"route_{i + 1}",
+                    "route_id": f"{route_id_prefix}_{i + 1}",
                     "total_distance_km": d_km,
                     "total_time_min": t_min,
                     "is_shortest": i == shortest_i,
@@ -848,6 +1014,36 @@ class RouterService:
             )
 
         return self._route_response(best_segments, shortest_segments, alternatives=alternatives)
+
+    def _forced_corridor_results(
+        self,
+        source_lat: float,
+        source_lng: float,
+        destination_lat: float,
+        destination_lng: float,
+        departure_time: datetime,
+    ) -> list[dict]:
+        results = []
+        for direction, waypoint_lat, waypoint_lng in _corridor_waypoints(
+            source_lat,
+            source_lng,
+            destination_lat,
+            destination_lng,
+        ):
+            result = self._osrm_routes(
+                source_lat,
+                source_lng,
+                destination_lat,
+                destination_lng,
+                departure_time,
+                waypoints=[(waypoint_lat, waypoint_lng)],
+                alternatives=False,
+                route_id_prefix=f"corridor_{direction}",
+                timeout_seconds=8.0,
+            )
+            if result:
+                results.append(result)
+        return results
 
     def _osrm_overview_route(
         self,
@@ -1019,6 +1215,7 @@ class RouterService:
             [destination_lng, destination_lat],
         ]
         with traffic_predictor.live_context(corridor):
+            route_results: list[dict | None] = []
             google_routes_api_result = self._google_routes_api(
                 source_lat,
                 source_lng,
@@ -1028,18 +1225,27 @@ class RouterService:
                 travel_mode,
             )
             if google_routes_api_result:
-                return google_routes_api_result
+                route_results.append(google_routes_api_result)
+            else:
+                google_result = self._google_routes(
+                    source_lat,
+                    source_lng,
+                    destination_lat,
+                    destination_lng,
+                    departure_time,
+                    travel_mode,
+                )
+                route_results.append(google_result)
 
-            google_result = self._google_routes(
-                source_lat,
-                source_lng,
-                destination_lat,
-                destination_lng,
-                departure_time,
-                travel_mode,
-            )
-            if google_result:
-                return google_result
+            merged_result = self._merge_route_results(route_results)
+            if (
+                merged_result
+                and len(merged_result["alternatives"])
+                >= TARGET_ROUTE_ALTERNATIVES
+            ):
+                return merged_result
+            if merged_result and travel_mode != "DRIVE":
+                return merged_result
 
             osrm_result = self._osrm_routes(
                 source_lat,
@@ -1048,8 +1254,32 @@ class RouterService:
                 destination_lng,
                 departure_time,
             )
-            if osrm_result:
-                return osrm_result
+            route_results.append(osrm_result)
+
+            merged_result = self._merge_route_results(route_results)
+            if (
+                merged_result
+                and len(merged_result["alternatives"])
+                >= TARGET_ROUTE_ALTERNATIVES
+            ):
+                return merged_result
+
+            if travel_mode == "DRIVE":
+                route_results.extend(
+                    self._forced_corridor_results(
+                        source_lat,
+                        source_lng,
+                        destination_lat,
+                        destination_lng,
+                        departure_time,
+                    )
+                )
+                merged_result = self._merge_route_results(route_results)
+                if merged_result:
+                    return merged_result
+
+            if merged_result:
+                return merged_result
 
             osrm_overview_result = self._osrm_overview_route(
                 source_lat,
